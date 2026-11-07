@@ -1,20 +1,24 @@
-# JMicron JMS578 Firmware Update & Optimization Guide
-### Fixing Linux UAS Stability, Disconnects, and Drive Spin-Down (With Emergency Hardware Unbrick)
+# JMicron JMS578 Firmware Update & Performance Guide
+### Fixing Linux UAS Stability, Disconnects, and Drive Standby (With Emergency BootROM Hardware Recovery)
 
-A battle-tested field manual for updating, configuring, and optimizing **JMicron JMS578** USB 3.0 to SATA bridge enclosures on Linux. Written to help developers and homelab enthusiasts navigate real-world pitfalls, understand NVRAM configurations, and safely recover from bricks via hardware BootROM.
+A battle-tested field manual for updating, configuring, and optimizing **JMicron JMS578** USB 3.0 to SATA bridge enclosures on Linux. Written to help developers, homelabbers, and storage enthusiasts navigate real-world firmware traps, configure valid NVRAM parameters, verify kernel UAS driver bindings, and recover bricked controllers via hardware BootROM.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Firmware: Hardkernel v173.01.00.02](https://img.shields.io/badge/Firmware-Hardkernel_v173.01.00.02-success.svg)](firmware/)
+[![Tested on Linux: 6.x / 7.x](https://img.shields.io/badge/Kernel-Linux_6.x_%2F_7.x-orange.svg)](https://kernel.org)
 
 ---
 
 ## Table of Contents
 1. [The Problem: Why Update JMS578 Firmware?](#1-the-problem-why-update-jms578-firmware)
 2. [Hardware Architecture & Mental Model](#2-hardware-architecture--mental-model)
-3. [Pre-flight Traps & How to Avoid Them](#3-pre-flight-traps--how-to-avoid-them)
-4. [Firmware Selection: What to Flash & What to Avoid](#4-firmware-selection-what-to-flash--what-to-avoid)
-5. [The NVRAM Decoupling Principle (Can ODD Firmware Be Used?)](#5-the-nvram-decoupling-principle-can-odd-firmware-be-used)
-6. [Tool Setup: Building `jms578flash` from Submodule](#6-tool-setup-building-jms578flash-from-submodule)
-7. [Step 1: Backing Up Factory Firmware](#7-step-1-backing-up-factory-firmware)
-8. [Step 2: Step-by-Step Firmware Flashing Procedure](#8-step-2-step-by-step-firmware-flashing-procedure)
-9. [Step 3: Enabling SuperSpeed UAS on Linux](#9-step-3-enabling-superspeed-uas-on-linux)
+3. [Firmware Selection: What to Flash & What to Avoid](#3-firmware-selection-what-to-flash--what-to-avoid)
+4. [The NVRAM Decoupling Principle (Can ODD Firmware Be Used?)](#4-the-nvram-decoupling-principle-can-odd-firmware-be-used)
+5. [Tool Setup: Building `jms578flash` with PUYA Support](#5-tool-setup-building-jms578flash-with-puya-support)
+6. [Step 1: Backing Up Factory Firmware](#6-step-1-backing-up-factory-firmware)
+7. [Step 2: Step-by-Step Firmware Flashing Procedure](#7-step-2-step-by-step-firmware-flashing-procedure)
+8. [Step 3: Enabling & Verifying SuperSpeed UAS on Linux](#8-step-3-enabling--verifying-superspeed-uas-on-linux)
+9. [Critical Caveats & Lessons Learned](#9-critical-caveats--lessons-learned)
 10. [Emergency Disaster Recovery: Hardware Unbricking (The Jig)](#10-emergency-disaster-recovery-hardware-unbricking-the-jig)
 11. [Digital Forensics: Recovering Lost Factory ROM from Raw SPI Logs](#11-digital-forensics-recovering-lost-factory-rom-from-raw-spi-logs)
 12. [Acknowledgements](#12-acknowledgements)
@@ -23,30 +27,29 @@ A battle-tested field manual for updating, configuring, and optimizing **JMicron
 
 ## 1. The Problem: Why Update JMS578 Firmware?
 
-The JMicron JMS578 is one of the most widespread USB 3.0 to SATA 6 Gb/s bridge chips, found in external drive enclosures from XDISK, Sabrent, Orico, and single-board computers like ODROID-HC1/HC2.
+The JMicron JMS578 is one of the most widely deployed USB 3.0 to SATA 6 Gb/s bridge controllers, found in external drive enclosures from XDISK, Sabrent, Orico, and single-board computers like ODROID-HC1/HC2.
 
-However, factory firmwares (especially OEM builds from 2016–2017) suffer from three critical shortcomings on Linux:
-1. **Linux Kernel Blacklists UAS**: The kernel detects old JMS578 firmware revisions and logs `UAS is ignored for this device, using usb-storage instead` (matching quirk `US_FL_IGNORE_UAS`). This locks transfers to slow legacy Bulk-Only Transport (BOT).
-2. **Never-Ending Spinning (No Standby)**: Many OEM firmwares completely disable drive spin-down (`Standby Timer = 0`). Mechanical disks spin at full speed 24/7, generating excessive heat and shortening drive lifespan.
-3. **Random Disconnects Under Heavy Load**: Certain early revisions trigger command timeouts or bus resets during sustained random I/O.
+However, factory OEM firmwares (predominantly 2016–2017 revisions like `32.02`) suffer from three major shortcomings under Linux:
 
-Updating to modern, Linux-optimized firmware (such as **Hardkernel `v173.01.00.02`**) resolves these issues, enabling native UAS throughput, SMART pass-through, and a clean **10-minute auto spin-down timer**.
+1. **UAS Bus Deadlock / Blacklist**: Older firmware revisions trigger bus lockups under command queuing. The Linux kernel marks these older revisions with `US_FL_IGNORE_UAS`, forcing fallback to slower Bulk-Only Transport (BOT).
+2. **Infinite Drive Spin (No Standby)**: Many OEM enclosures ship with the standby timer disabled (`Timer = 0`). Mechanical disks spin at full speed 24/7, generating excessive heat and shortening drive lifespan.
+3. **Random Bus Resets Under Heavy I/O**: High queue depth operations (e.g. `zfs scrub`, multi-stream transfers, or database writes) cause controller crashes on stock firmware.
+
+Updating to **Hardkernel `v173.01.00.02`** resolves these defects: it enables native, stable **USB Attached SCSI (UAS)**, full **SMART pass-through** (`smartctl -a /dev/sdX`), and an automatic **10-minute drive spin-down timer**.
 
 ---
 
 ## 2. Hardware Architecture & Mental Model
 
-Before touching firmware, it is essential to understand the board's physical layout:
-
 ```mermaid
 graph LR
-    Host["Host Computer<br/>(Linux / xHCI)"] -- "USB 3.0 (5 Gbps SuperSpeed)" --> JMS578["JMicron JMS578 SoC<br/>(8051 Microcontroller + RAM + BootROM)"]
+    Host["Host Computer<br/>(Linux / xHCI)"] -- "USB 3.0 (5 Gbps SuperSpeed)" --> JMS578["JMicron JMS578 Controller<br/>(8051 MCU + RAM + ROM)"]
     JMS578 -- "SPI Bus (4-Wire)" --> SPIFlash["SPI NOR Flash (SOIC-8, 256 KB)<br/>PUYA P25D21 / Winbond<br/>[48 KB Code + 512 B NVRAM]"]
     JMS578 -- "SATA III (6 Gbps)" --> Drive["SATA Storage Drive<br/>(Mechanical HDD / SSD)"]
 ```
 
-- **JMS578 Bridge Controller**: An 8051-based SoC with USB 3.0 and SATA III PHYs. **It contains zero persistent flash memory.** When power is cut, all internal state is lost.
-- **SPI NOR Flash (8-pin SOIC-8)**: The **sole persistent storage** on the board. On power-up, the 8051 engine reads executable code and configuration tables from this chip.
+- **JMS578 Bridge Controller**: Contains an 8051 microcontroller running at 30–60 MHz. It has **no onboard writable flash memory**. All persistent configuration is loaded from the external SPI flash at boot.
+- **SPI NOR Flash (SOIC-8)**: The sole non-volatile memory on the PCB. It stores 48 KB of 8051 executable binary code and a 512-byte NVRAM configuration block.
 - **Firmware Binary Layout (`.bin`, 50,688 bytes)**:
 
 ```mermaid
@@ -71,34 +74,20 @@ flowchart TD
 
 ---
 
-## 3. Pre-flight Traps & How to Avoid Them
+## 3. Firmware Selection: What to Flash & What to Avoid
 
-Learning from real-world testing, here are the most frequent pitfalls:
-
-| Trap | What Happens | The Rule |
-| :--- | :--- | :--- |
-| **Flashing an ODD-mode image** | Byte `0x0E7 = 0xC6` makes the chip expect CD/DVD laser/tray GPIOs. Firmware freezes in a deadlock before opening USB. | Never flash a binary with `ODD` in its name directly to an HDD enclosure. |
-| **Passing `-mods ClearNVRAM`** | Overwrites all 512 bytes of NVRAM with `0xFF`. Enclosure loses GPIO mapping and drops to generic fallback `152d:0579 BOT`. | Never use `ClearNVRAM` unless explicitly instructed to wipe custom configurations. |
-| **Missing SATA drive during flash** | BootROM and flasher tool fail with `no such file or directory`. | The JMS578 requires drive impedance on the SATA port to create a SCSI block handle (`/dev/sdX`). |
-| **Hot-plugging 3.5" drives** | Inrush current on 12V/5V rails drops supply voltage, crashing the controller or triggering MOSFET protection. | Always seat the drive into the SATA connector before connecting DC power. |
-| **Running without root privileges** | Linux kernel blocks raw SCSI vendor commands with `permission denied` (`EACCES`). | Always invoke the flasher with `sudo`. |
-
----
-
-## 4. Firmware Selection: What to Flash & What to Avoid
-
-| Firmware Candidate | Disk Mode (`0x0E7`) | GPIO Config | Standby Timer | Linux UAS Stability | Verdict |
+| Firmware Image | Disk Mode (`0x0E7`) | GPIO Config | Standby Timer | Linux UAS Stability | Verdict |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Hardkernel ODROID (`v173.01.00.02`)** | **`0xC3` (HDD)** | **`0x38 0xC1`** | **10 Minutes (`600s`)** | **Optimal (UAS + SMART)** | **RECOMMENDED** |
-| **Factory OEM Dump (`32.02`)** | `0x43` (HDD) | `0x30 0xC0` | Disabled (`0s`) | Blacklisted (`usb-storage`) | Keep as emergency fallback |
-| **JMicron STD ODD (`v00.04.01.04`)** | `0xC6` (ODD) | `0x28 0xC9` | 10 Minutes (`600s`) | ATAPI Polling Deadlock | **DO NOT FLASH (Causes Brick)** |
+| **Factory OEM Dump (`32.02`)** | `0x43` (HDD) | `0x30 0xC0` | Disabled (`0s`) | Blacklisted (`usb-storage`) | Keep as emergency backup |
+| **JMicron STD ODD (`v00.04.01.04`)** | `0xC6` (ODD) | `0x28 0xC9` | 10 Minutes (`600s`) | Deadlock (Tray Poll Loop) | **DO NOT FLASH (Bricks Board)** |
 
 ### Why Hardkernel `v173.01.00.02` is the Gold Standard:
-Co-developed by Hardkernel and JMicron for the ODROID-HC1/HC2 Linux NAS platforms, this build fixes command queueing timeouts under xHCI, enables clean ATA pass-through for `smartctl`, and manages drive standby without bus resets.
+Originally developed for the ODROID-HC1/HC2 Linux NAS platforms, this build fixes xHCI command queueing timeouts, enables clean ATA pass-through for `smartctl`, and handles drive standby without bus resets.
 
 ---
 
-## 5. The NVRAM Decoupling Principle (Can ODD Firmware Be Used?)
+## 4. The NVRAM Decoupling Principle (Can ODD Firmware Be Used?)
 
 > [!NOTE]
 > The 8051 machine code inside `JMS578_STD_v00.04.01.04_Self Power + ODD.bin` is **NOT corrupt**. The crash is caused exclusively by the **ODD NVRAM block** bundled at the tail of the file.
@@ -114,18 +103,21 @@ If you ever need features from the `00.04.01.04` codebase, do not flash the `.bi
 
 ---
 
-## 6. Tool Setup: Building `jms578flash` from Submodule
+## 5. Tool Setup: Building `jms578flash` with PUYA Support
 
-Many recent enclosures use **PUYA Semiconductor P25D21 / P25Q20** NOR flash chips (`JEDEC ID: 0x85441285`). Upstream `jms578flash` lacks this ID and terminates with `unsupported flash type: 85441285`.
+Many modern enclosures use **PUYA Semiconductor P25D21 / P25Q20** NOR flash chips (`JEDEC ID: 0x85441285`). Upstream `jms578flash` lacks this ID and terminates with:
+```
+unsupported flash type: 85441285
+```
 
-This repository includes a git submodule pointing to upstream `jms578flash`, a patch file [`tools/puya_flash_support.patch`](tools/puya_flash_support.patch), and an automated build script:
+This repository includes a git submodule for upstream `jms578flash`, a patch file [`tools/puya_flash_support.patch`](tools/puya_flash_support.patch), and an automated containerized build script:
 
 ```bash
 # Clone the repository with submodules
-git clone --recursive https://github.com/khoipm06/jms578-unbrick-guide.git
-cd jms578-unbrick-guide
+git clone --recursive https://github.com/khoipm06/jms578-firmware-guide.git
+cd jms578-firmware-guide
 
-# Run the automated build script (uses Podman, Docker, or native Go)
+# Build the patched static binary (uses Podman, Docker, or native Go)
 ./tools/build.sh
 ```
 
@@ -133,24 +125,25 @@ The script automatically initializes the submodule, applies the PUYA patch, and 
 
 ---
 
-## 7. Step 1: Backing Up Factory Firmware
+## 6. Step 1: Backing Up Factory Firmware
 
 **Always dump your existing firmware before flashing anything:**
 
-1. Connect your enclosure with a drive attached.
-2. Identify the device node (e.g. `/dev/sda` via `lsblk`).
-3. Extract the current SPI flash content:
-
 ```bash
+# 1. Identify your enclosure block device (e.g. /dev/sda)
+lsblk
+
+# 2. Extract current SPI flash content
 sudo tools/jms578flash_x86_64 -dev /dev/sda -extract -firmware backup_original.bin
 ```
 
 ---
 
-## 8. Step 2: Step-by-Step Firmware Flashing Procedure
+## 7. Step 2: Step-by-Step Firmware Flashing Procedure
 
-Once backed up, flash the optimized Hardkernel firmware:
+Once the device is recognized (e.g. at `/dev/sda`):
 
+### Option A: Flash the Recommended Hardkernel Firmware
 ```bash
 sudo tools/jms578flash_x86_64 \
   -dev /dev/sda \
@@ -160,58 +153,102 @@ sudo tools/jms578flash_x86_64 \
   -unsafe
 ```
 
-### Explaining the Flags:
-- `-dev /dev/sda`: Target SCSI block device path.
-- `-flash`: Sets execution mode to write.
-- `-firmware <file>`: Path to the target image.
-- `-hook=false`: Prevents injecting third-party assembly hooks into the code, ensuring a 100% clean vendor image.
-- `-unsafe`: Mandatory safety bypass flag to allow erase (`0x60`) and page write (`0x02`) operations.
-- **NEVER pass `-mods ClearNVRAM`**: Omitting this flag preserves the valid HDD NVRAM and spin-down timer.
+### Option B: Restore Original Factory Firmware (Rollback)
+```bash
+sudo tools/jms578flash_x86_64 \
+  -dev /dev/sda \
+  -flash \
+  -firmware firmware/factory_restoration.bin \
+  -hook=false \
+  -unsafe
+```
+
+### Explanation of Mandatory Flags:
+- `-dev /dev/sda`: SCSI block device node for the enclosure.
+- `-flash`: Enables write/reflash mode on the SPI flash.
+- `-firmware <file>`: Target firmware binary path.
+- `-hook=false`: Writes 100% clean vendor machine code, preventing the insertion of external ASM hooks.
+- `-unsafe`: Disengages the safety interlock to allow raw sector erase (`0x60`) and page write (`0x02`) commands.
+- **NEVER pass `-mods ClearNVRAM`**: Preserves the valid NVRAM configuration table (GPIO assignments, LED mapping, and the 10-minute standby timer).
 
 ### Post-Flash Hard Power Cycle:
-1. Run `sync` in terminal.
-2. Unplug the USB cable $\to$ Unplug the 12V DC power jack.
-3. Wait **5 seconds** for capacitors to discharge.
-4. Plug in the 12V DC power jack $\to$ Reconnect the USB cable.
+1. Run `sync` in your terminal to flush filesystem caches.
+2. Unplug the USB cable $\to$ Unplug the 12V DC power barrel jack.
+3. Wait **5 seconds** for power capacitors to fully discharge.
+4. Plug in the 12V DC power barrel jack $\to$ Reconnect the USB cable so the controller loads the new configuration.
 
 ---
 
-## 9. Step 3: Enabling SuperSpeed UAS on Linux
+## 8. Step 3: Enabling & Verifying SuperSpeed UAS on Linux
 
-By default, the Linux kernel sets quirk `0x1800000` (`US_FL_IGNORE_UAS`) for all `152d:0578` devices due to legacy 2016-era bugs. 
+### Linux Kernel Driver Behavior:
+By default, the Linux kernel sets quirk `0x1800000` (`US_FL_IGNORE_UAS`) for VID:PID `152d:0578` devices running legacy 2016-era firmwares due to command queuing lockups.
 
-With the **Hardkernel 2019 firmware** installed, UAS stability is resolved. Enable UAS using the included helper script:
+With **Hardkernel `v173.01.00.02`** flashed, controller stability is resolved. On modern Linux kernels (5.x, 6.x, 7.x), the kernel automatically binds `152d:0578` directly to `Driver=uas` without requiring any manual quirks.
 
-```bash
-sudo ./scripts/enable_uas.sh
-```
+> [!NOTE]
+> In Linux kernel source code (`drivers/usb/storage/usb.c`), the quirk character `u` corresponds to `US_FL_IGNORE_UAS` (bypasses the UAS driver and forces `usb-storage`). Do not configure `quirks=152d:0578:u` in `/etc/modprobe.d/`. If an erroneous file exists, remove it:
+> ```bash
+> sudo rm -f /etc/modprobe.d/jms578*.conf
+> ```
 
-Or configure modprobe manually:
-```bash
-echo "options usb-storage quirks=152d:0578:u" | sudo tee /etc/modprobe.d/jms578-uas.conf
-```
-
-Verify that the `uas` driver is active:
+### Verifying UAS Status:
+Check the USB driver tree:
 ```bash
 lsusb -t
 ```
-Under your USB hub, the mass storage interface must report `Driver=uas`.
+Under your USB 3.0 root hub, the mass storage interface will report:
+```
+|__ Port 001: Dev 002, If 0, Class=Mass Storage, Driver=uas, 5000M
+```
+
+Or run the included diagnostic script:
+```bash
+./scripts/check_uas.sh
+```
+
+---
+
+## 9. Critical Caveats & Lessons Learned
+
+1. **Never Hot-Plug 3.5" Hard Drives into a Powered Board**: The instant inrush current when a mechanical spindle motor spins up is very high. Hot-plugging causes a severe voltage drop on the 12V/5V rails, resetting the microcontroller or causing voltage spikes that can destroy the power MOSFET or the SATA PHY. **Always seat the drive into the SATA port before connecting 12V DC power.**
+2. **Always Check the ODD Flag Before Flashing**: Inside any firmware `.bin` image, check the byte at offset `0xC4E7`. If `bit 2 = 1` (such as `0xC6`), the image is compiled for an Optical Disc Drive (CD/DVD). Flashing this to a hard drive enclosure causes an immediate BootROM deadlock because the chip halts waiting for tray and laser GPIO responses.
+3. **Never Use Unpowered USB Hubs During Recovery**: Initial BootROM enumeration is sensitive to bus latency and voltage dips. Flashing through cheap hubs frequently causes USB timeout errors (`error -71` / `error -110`). Always plug the USB cable directly into a motherboard port.
+4. **Always Back Up the Original NVRAM**: Different enclosure manufacturers wire the drive activity LED and the power MOSFET gate to different GPIO pins on the JMS578. Keeping an intact backup of your factory NVRAM ensures you can restore correct pin assignments for your specific enclosure hardware.
 
 ---
 
 ## 10. Emergency Disaster Recovery: Hardware Unbricking (The Jig)
 
-If your board is completely frozen (two solid LEDs, zero USB response), you can bypass external SPI flash and enter the chip's internal **BootROM**.
+If your board is completely frozen (two solid LEDs, zero USB enumeration, no `/dev/sdX`), the 8051 microcontroller is stuck in an execution loop. You must force the chip into its internal **ROM Bootloader** by disabling external SPI flash reads during power-up.
 
-### SOIC-8 Flash Pinout
+### SOIC-8 Flash Pinout & Bridge Target
+
+```mermaid
+graph TD
+    subgraph SOIC8["SOIC-8 Flash Pinout (Top View)"]
+        direction LR
+        subgraph LeftPins["Left Side (Pins 1 - 4)"]
+            direction TB
+            P1["Pin 1: CE# (Chip Enable)"]
+            P2["Pin 2: MISO (Data Out) ⚡ BRIDGE"]
+            P3["Pin 3: WP# (Write Protect)"]
+            P4["Pin 4: GND (Ground) ⚡ BRIDGE"]
+        end
+        subgraph RightPins["Right Side (Pins 5 - 8)"]
+            direction TB
+            P8["Pin 8: VCC (3.3V Power)"]
+            P7["Pin 7: HOLD#"]
+            P6["Pin 6: SCK (Clock)"]
+            P5["Pin 5: MOSI (Data In)"]
+        end
+    end
+    P2 <-->|"Bridge with tweezers (1-2s)"| P4
+    style P2 fill:#ff7043,stroke:#333,stroke-width:2px,color:#fff
+    style P4 fill:#ff7043,stroke:#333,stroke-width:2px,color:#fff
 ```
-             ┌───[•]───┐
- (CE#) Pin 1 │ o       │ Pin 8 (VCC 3.3V)
-(MISO) Pin 2 │  SHORT  │ Pin 7 (HOLD#)
- (WP#) Pin 3 │    │    │ Pin 6 (SCK)
- (GND) Pin 4 │◄───┘    │ Pin 5 (MOSI)
-             └─────────┘
-```
+
+### The Unbrick Sequence:
 
 ```mermaid
 sequenceDiagram
@@ -238,7 +275,7 @@ sequenceDiagram
 5. While holding the short, plug in the 12V DC power jack.
 6. Hold for **1 to 2 seconds**, then release the tweezers immediately.
 7. The Activity LED will turn off; the host computer will enumerate the device under BootROM.
-8. Re-flash a known-good image using the standard flashing command.
+8. Re-flash the safe Hardkernel firmware using the standard flashing command in [Step 2](#7-step-2-step-by-step-firmware-flashing-procedure).
 
 ---
 
