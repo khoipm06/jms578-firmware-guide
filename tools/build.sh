@@ -1,52 +1,48 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# Build Script for jms578flash with PUYA Flash IC Support
-# ==============================================================================
-set -euo pipefail
+# Build script for jms578flash with PUYA SPI Flash support
+
+set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SUBMODULE_DIR="${SCRIPT_DIR}/jms578flash"
-PATCH_FILE="${SCRIPT_DIR}/puya_flash_support.patch"
-OUTPUT_BINARY="${SCRIPT_DIR}/jms578flash_x86_64"
+SRC_DIR="$SCRIPT_DIR/jms578flash-src"
+PATCH_FILE="$SCRIPT_DIR/puya_flash_support.patch"
+OUTPUT_BINARY="$SCRIPT_DIR/jms578flash_x86_64"
 
-echo "==> [1/4] Checking jms578flash submodule..."
-if [[ ! -f "${SUBMODULE_DIR}/main.go" ]]; then
-    echo "    Submodule not initialized. Initializing..."
-    git -C "${REPO_ROOT}" submodule update --init --recursive tools/jms578flash
+echo "==> [1/3] Checking submodule source..."
+if [ ! -f "$SRC_DIR/main.go" ]; then
+    echo "Submodule not initialized. Initializing..."
+    git -C "$SCRIPT_DIR/.." submodule update --init --recursive
 fi
 
-echo "==> [2/4] Applying PUYA flash IC patch..."
-# Check if patch is already applied
-if git -C "${SUBMODULE_DIR}" apply --check "${PATCH_FILE}" >/dev/null 2>&1; then
-    echo "    Applying ${PATCH_FILE}..."
-    git -C "${SUBMODULE_DIR}" apply "${PATCH_FILE}"
-elif grep -q "0x85441285" "${SUBMODULE_DIR}/spiflash/types.go"; then
-    echo "    Patch already applied in ${SUBMODULE_DIR}/spiflash/types.go."
+echo "==> [2/3] Applying PUYA flash support patch if not already applied..."
+if ! grep -q "0x85441285" "$SRC_DIR/spiflash/types.go"; then
+    echo "Applying $PATCH_FILE..."
+    git -C "$SRC_DIR" apply "$PATCH_FILE"
+    echo "Patch applied successfully."
 else
-    echo "    Warning: Could not apply patch automatically. Checking types.go manually..."
+    echo "Patch already present in source."
 fi
 
-echo "==> [3/4] Compiling static x86_64 binary..."
+echo "==> [3/3] Compiling jms578flash binary..."
 if command -v podman >/dev/null 2>&1; then
-    echo "    Using Podman (golang:alpine container)..."
-    podman run --rm -v "${SUBMODULE_DIR}":/src:Z -w /src golang:alpine \
-        go build -ldflags="-s -w" -o /src/jms578flash_x86_64 .
-    mv "${SUBMODULE_DIR}/jms578flash_x86_64" "${OUTPUT_BINARY}"
+    echo "Using Podman container with golang:alpine..."
+    podman run --rm -v "$SRC_DIR":/app:Z -w /app golang:alpine \
+        go build -ldflags="-s -w" -o /app/jms578flash_x86_64 .
+    mv "$SRC_DIR/jms578flash_x86_64" "$OUTPUT_BINARY"
 elif command -v docker >/dev/null 2>&1; then
-    echo "    Using Docker (golang:alpine container)..."
-    docker run --rm -v "${SUBMODULE_DIR}":/src -w /src golang:alpine \
-        go build -ldflags="-s -w" -o /src/jms578flash_x86_64 .
-    mv "${SUBMODULE_DIR}/jms578flash_x86_64" "${OUTPUT_BINARY}"
+    echo "Using Docker container with golang:alpine..."
+    docker run --rm -v "$SRC_DIR":/app -w /app golang:alpine \
+        go build -ldflags="-s -w" -o /app/jms578flash_x86_64 .
+    mv "$SRC_DIR/jms578flash_x86_64" "$OUTPUT_BINARY"
 elif command -v go >/dev/null 2>&1; then
-    echo "    Using host Go compiler..."
-    (cd "${SUBMODULE_DIR}" && go build -ldflags="-s -w" -o "${OUTPUT_BINARY}" .)
+    echo "Using native Go compiler..."
+    cd "$SRC_DIR"
+    go build -ldflags="-s -w" -o "$OUTPUT_BINARY" .
 else
-    echo "ERROR: Neither podman, docker, nor go compiler found on system." >&2
+    echo "ERROR: Neither podman, docker, nor go is installed on your system."
     exit 1
 fi
 
-chmod +x "${OUTPUT_BINARY}"
-echo "==> [4/4] Build complete! Binary saved to:"
-echo "    ${OUTPUT_BINARY}"
-ls -lh "${OUTPUT_BINARY}"
+chmod +x "$OUTPUT_BINARY"
+echo "==> SUCCESS: Compiled binary is ready at: $OUTPUT_BINARY"
+"$OUTPUT_BINARY" -h 2>&1 | head -n 4 || true
