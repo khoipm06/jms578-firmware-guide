@@ -1,0 +1,3 @@
+[submodule "tools/jms578flash"]
+	path = tools/jms578flash
+	url = https://github.com/BertoldVdb/jms578flash.git
