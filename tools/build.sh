@@ -23,26 +23,25 @@ else
     echo "Patch already present in source."
 fi
 
-echo "==> [3/3] Compiling jms578flash binary..."
+echo "==> [3/3] Compiling static jms578flash binary..."
 if command -v podman >/dev/null 2>&1; then
-    echo "Using Podman container with golang:alpine..."
-    podman run --rm -v "$SRC_DIR":/app:Z -w /app golang:alpine \
+    echo "Using Podman container with golang:alpine (statically linked)..."
+    podman run --rm -v "$SRC_DIR":/app:Z -w /app -e CGO_ENABLED=0 golang:alpine \
         go build -ldflags="-s -w" -o /app/jms578flash_x86_64 .
     mv "$SRC_DIR/jms578flash_x86_64" "$OUTPUT_BINARY"
 elif command -v docker >/dev/null 2>&1; then
-    echo "Using Docker container with golang:alpine..."
-    docker run --rm -v "$SRC_DIR":/app -w /app golang:alpine \
+    echo "Using Docker container with golang:alpine (statically linked)..."
+    docker run --rm -v "$SRC_DIR":/app -w /app -e CGO_ENABLED=0 golang:alpine \
         go build -ldflags="-s -w" -o /app/jms578flash_x86_64 .
     mv "$SRC_DIR/jms578flash_x86_64" "$OUTPUT_BINARY"
 elif command -v go >/dev/null 2>&1; then
-    echo "Using native Go compiler..."
-    cd "$SRC_DIR"
-    go build -ldflags="-s -w" -o "$OUTPUT_BINARY" .
+    echo "Using native Go compiler (statically linked)..."
+    (cd "$SRC_DIR" && CGO_ENABLED=0 go build -ldflags="-s -w" -o "$OUTPUT_BINARY" .)
 else
     echo "ERROR: Neither podman, docker, nor go is installed on your system."
     exit 1
 fi
 
 chmod +x "$OUTPUT_BINARY"
-echo "==> SUCCESS: Compiled binary is ready at: $OUTPUT_BINARY"
+echo "==> SUCCESS: Compiled static binary is ready at: $OUTPUT_BINARY"
 "$OUTPUT_BINARY" -h 2>&1 | head -n 4 || true
